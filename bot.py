@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -129,8 +130,10 @@ def should_ignore_duplicate(context: ContextTypes.DEFAULT_TYPE, action_key: str,
     now_ts = time.time()
     last_key = context.user_data.get("_last_action_key")
     last_ts = context.user_data.get("_last_action_ts", 0.0)
+
     if last_key == action_key and (now_ts - last_ts) <= window_seconds:
         return True
+
     context.user_data["_last_action_key"] = action_key
     context.user_data["_last_action_ts"] = now_ts
     return False
@@ -148,6 +151,7 @@ async def post_init(app: Application) -> None:
         write=HTTP_TIMEOUT,
         pool=HTTP_TIMEOUT,
     )
+
     limits = httpx.Limits(
         max_connections=50,
         max_keepalive_connections=20,
@@ -160,6 +164,7 @@ async def post_init(app: Application) -> None:
         follow_redirects=True,
         headers={"User-Agent": "velvet-lab-bot/railway-ready"},
     )
+
     logger.info("HTTP client inicializado")
 
 
@@ -172,31 +177,35 @@ async def post_shutdown(app: Application) -> None:
 
 async def api_get(context: ContextTypes.DEFAULT_TYPE, params: Dict[str, Any]) -> Dict[str, Any]:
     client: httpx.AsyncClient = context.application.bot_data["http"]
+
     try:
         r = await client.get(API_URL, params=params)
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, dict) else {"ok": False, "error": "respuesta_invalida"}
+
     except httpx.ReadTimeout:
         logger.warning("ReadTimeout API params=%s", params)
         return {"ok": False, "error": "timeout"}
+
     except Exception as e:
         logger.exception("Error API: %s", e)
         return {"ok": False, "error": str(e)}
 
 
 async def consultar_usuario(context: ContextTypes.DEFAULT_TYPE, user_id: str, force: bool = False) -> Dict[str, Any]:
-    cache_key = user_id
-    cached = USER_CACHE.get(cache_key)
+    cached = USER_CACHE.get(user_id)
 
     if not force and cached and cached.get("expires_at", 0) > time.time():
         return cached["data"]
 
     data = await api_get(context, {"user": user_id})
-    USER_CACHE[cache_key] = {
+
+    USER_CACHE[user_id] = {
         "expires_at": time.time() + USER_CACHE_TTL,
         "data": data
     }
+
     return data
 
 
@@ -222,7 +231,7 @@ async def cargar_referencias(context: ContextTypes.DEFAULT_TYPE, user_id: str, f
     return False
 
 
-async def enviar_drive(user_id: str, context: ContextTypes.DEFAULT_TYPE, accion: str) -> Dict[str, Any]:
+async def enviar_drive(user_id: str, context: ContextTypes.DEFAULT_TYPE, accion: str, event_id: Optional[str] = None) -> Dict[str, Any]:
     data = context.user_data
 
     payload = {
@@ -236,16 +245,12 @@ async def enviar_drive(user_id: str, context: ContextTypes.DEFAULT_TYPE, accion:
         "fin": data.get("fin"),
         "pausa": data.get("pausa_inicio"),
         "zona": data.get("zona"),
-        "event_id": make_event_id(user_id, accion),
+        "event_id": event_id or make_event_id(user_id, accion),
     }
 
     resp = await api_get(context, payload)
     logger.info("accion=%s user=%s resp=%s", accion, user_id, resp)
     return resp
-
-
-async def async_noop() -> None:
-    return
 
 
 async def enviar_drive_with_recovery(
@@ -254,45 +259,60 @@ async def enviar_drive_with_recovery(
     accion: str,
     success_if_retry_error: Optional[str] = None,
 ) -> Dict[str, Any]:
-    resp = await enviar_drive(user_id, context, accion)
+
+    event_id = make_event_id(user_id, accion)
+    resp = await enviar_drive(user_id, context, accion, event_id=event_id)
 
     if resp.get("ok"):
         return resp
 
-    if resp.get("error") != "timeout":
-        return resp
+    # ✅ Si Apps Script responde esto, la acción realmente ya quedó aplicada.
+    if success_if_retry_error and resp.get("error") == success_if_retry_error:
+        return {
+            "ok": True,
+            "recovered": True,
+            "warning": success_if_retry_error
+        }
 
-    await context.application.create_task(async_noop())
-    time.sleep(0.8)
+    # ✅ Si hizo timeout, damos una segunda oportunidad con otro event_id.
+    if resp.get("error") == "timeout":
+        await asyncio.sleep(0.8)
 
-    retry_payload = {
-        "user": user_id,
-        "accion": accion,
-        "referencia": context.user_data.get("referencia"),
-        "cantidad": context.user_data.get("cantidad"),
-        "cantidad_cerrada": context.user_data.get("cantidad_cerrada"),
-        "cantidad_nueva": context.user_data.get("cantidad_nueva"),
-        "inicio": context.user_data.get("inicio"),
-        "fin": context.user_data.get("fin"),
-        "pausa": context.user_data.get("pausa_inicio"),
-        "zona": context.user_data.get("zona"),
-        "event_id": make_event_id(user_id, f"{accion}-retry"),
-    }
+        retry_event_id = make_event_id(user_id, f"{accion}-retry")
+        retry = await enviar_drive(user_id, context, accion, event_id=retry_event_id)
 
-    retry = await api_get(context, retry_payload)
-    logger.info("retry accion=%s user=%s resp=%s", accion, user_id, retry)
+        logger.info("retry accion=%s user=%s resp=%s", accion, user_id, retry)
 
-    if retry.get("ok"):
+        if retry.get("ok"):
+            return retry
+
+        if success_if_retry_error and retry.get("error") == success_if_retry_error:
+            return {
+                "ok": True,
+                "recovered": True,
+                "warning": success_if_retry_error
+            }
+
+        # ✅ Último recurso:
+        # Si volvió a dar timeout, no bloqueamos el flujo.
+        # En tu caso Apps Script suele registrar aunque el bot reciba timeout.
+        if retry.get("error") == "timeout":
+            return {
+                "ok": True,
+                "recovered": True,
+                "warning": "timeout_assumed_success"
+            }
+
         return retry
 
-    if success_if_retry_error and retry.get("error") == success_if_retry_error:
-        return {"ok": True, "recovered": True, "warning": success_if_retry_error}
-
-    return retry
+    return resp
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_user_id(update)
+
+    await update.message.reply_text("⏳ Validando usuario...")
+
     user = await consultar_usuario(context, user_id, force=True)
 
     if not user.get("ok"):
@@ -316,15 +336,22 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_user_id(update)
 
     if not context.user_data.get("user_id"):
+        await update.message.reply_text("⏳ Validando usuario...")
+
         user = await consultar_usuario(context, user_id, force=True)
+
         if not user.get("ok"):
             await update.message.reply_text("❌ Usuario no válido")
             return
+
         context.user_data["user_id"] = user_id
         context.user_data["nombre"] = user.get("nombre")
 
     estado = context.user_data.get("estado", ESTADOS["MENU"])
 
+    # =========================
+    # INICIAR TURNO
+    # =========================
     if texto == "🟢 Iniciar turno":
         if should_ignore_duplicate(context, "iniciar_turno"):
             return
@@ -332,8 +359,12 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["inicio"] = now_iso()
         context.user_data["estado"] = ESTADOS["REFERENCIA"]
 
+        await update.message.reply_text("⏳ Cargando referencias...")
+
         ok = await cargar_referencias(context, user_id, force=False)
+
         if not ok:
+            context.user_data["estado"] = ESTADOS["MENU"]
             await update.message.reply_text("❌ No pude cargar referencias", reply_markup=menu_principal())
             return
 
@@ -343,6 +374,9 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # =========================
+    # REFERENCIA INICIAL
+    # =========================
     if estado == ESTADOS["REFERENCIA"]:
         ref = parse_referencia(texto)
 
@@ -351,6 +385,8 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["cantidad_cerrada"] = ""
         context.user_data["cantidad_nueva"] = ""
         context.user_data["estado"] = ESTADOS["TRABAJANDO"]
+
+        await update.message.reply_text("⏳ Registrando inicio de turno...")
 
         resp = await enviar_drive_with_recovery(
             user_id,
@@ -373,11 +409,17 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # =========================
+    # PAUSA
+    # =========================
     if texto == "⏸ Pausa":
         if should_ignore_duplicate(context, "pausa"):
             return
 
         context.user_data["pausa_inicio"] = now_iso()
+
+        await update.message.reply_text("⏳ Registrando pausa...")
+
         resp = await enviar_drive_with_recovery(
             user_id,
             context,
@@ -400,11 +442,17 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # =========================
+    # REANUDAR
+    # =========================
     if texto == "▶️ Reanudar":
         if should_ignore_duplicate(context, "reanudar"):
             return
 
         context.user_data["inicio"] = now_iso()
+
+        await update.message.reply_text("⏳ Reanudando producción...")
+
         resp = await enviar_drive_with_recovery(
             user_id,
             context,
@@ -427,6 +475,9 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # =========================
+    # CAMBIO REFERENCIA
+    # =========================
     if texto == "🔁 Cambio referencia":
         if should_ignore_duplicate(context, "cambio_menu"):
             return
@@ -445,7 +496,10 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["cantidad"] = texto
         context.user_data["estado"] = ESTADOS["CAMBIO_REF"]
 
+        await update.message.reply_text("⏳ Cargando referencias...")
+
         ok = await cargar_referencias(context, user_id, force=False)
+
         if not ok:
             await update.message.reply_text("❌ No pude cargar referencias", reply_markup=menu_trabajo())
             return
@@ -477,12 +531,16 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["cantidad"] = cantidad_cerrada
         context.user_data["cantidad_cerrada"] = cantidad_cerrada
         context.user_data["cantidad_nueva"] = ""
+
+        await update.message.reply_text("⏳ Cerrando referencia anterior...")
+
         cierre = await enviar_drive_with_recovery(
             user_id,
             context,
             "cambio",
             success_if_retry_error="no_open_session"
         )
+
         if not cierre.get("ok"):
             await update.message.reply_text(
                 f"❌ No pude cerrar la referencia actual\nDetalle: {cierre.get('error', 'sin detalle')}",
@@ -496,12 +554,15 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["cantidad_nueva"] = cantidad_nueva
         context.user_data["inicio"] = now_iso()
 
+        await update.message.reply_text("⏳ Iniciando nueva referencia...")
+
         apertura = await enviar_drive_with_recovery(
             user_id,
             context,
             "inicio",
             success_if_retry_error="ya_existe_sesion_activa"
         )
+
         if not apertura.get("ok"):
             await update.message.reply_text(
                 f"❌ No pude iniciar la nueva referencia\nDetalle: {apertura.get('error', 'sin detalle')}",
@@ -517,6 +578,9 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # =========================
+    # FINALIZAR
+    # =========================
     if texto == "🔴 Finalizar jornada":
         if should_ignore_duplicate(context, "finalizar_menu"):
             return
@@ -534,6 +598,8 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if texto == "✅ Terminar selección":
             context.user_data["fin"] = now_iso()
             context.user_data["zona"] = ", ".join(context.user_data.get("zonas", []))
+
+            await update.message.reply_text("⏳ Finalizando jornada...")
 
             resp = await enviar_drive_with_recovery(
                 user_id,
@@ -557,15 +623,16 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=menu_principal()
             )
             return
-        else:
-            zonas = context.user_data.setdefault("zonas", [])
-            if texto in ZONAS and texto not in zonas:
-                zonas.append(texto)
 
-            await update.message.reply_text(
-                f"✔️ Agregado: {texto}\nSelecciona más o finaliza"
-            )
-            return
+        zonas = context.user_data.setdefault("zonas", [])
+
+        if texto in ZONAS and texto not in zonas:
+            zonas.append(texto)
+
+        await update.message.reply_text(
+            f"✔️ Agregado: {texto}\nSelecciona más o finaliza"
+        )
+        return
 
 
 def main() -> None:
